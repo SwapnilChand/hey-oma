@@ -1,0 +1,13 @@
+[Unit]
+Description=hey oma voice launcher
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin
+ExecStart=/bin/sh -c 'export HYPRLAND_INSTANCE_SIGNATURE=$(ls -t $XDG_RUNTIME_DIR/hypr | head -1); exec %h/.local/bin/hey-oma'
+Restart=on-failure
+SuccessExitStatus=143
+
+[Install]
+WantedBy=graphical-session.target

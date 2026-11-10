@@ -1,0 +1,234 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = ["vosk", "piper-tts"]
+# ///
+"""hey-oma: say "hey oma <command>" and it runs. Offline (Vosk), no LLM.
+
+Edit COMMANDS to add phrases, REPLIES for what oma says back.
+`hey-oma --warm` pre-generates every reply in your voice; `hey-oma --test` runs the self-check.
+"""
+import base64, json, os, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, wave
+
+MODEL = os.path.expanduser("~/.local/share/hey-oma/model")
+WAKE = "hey oma"
+MPRIS = "busctl --user call org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player"
+WEB = "omarchy-launch-webapp"
+CLOSE = "hyprctl dispatch 'hl.dsp.window.close"  # Hyprland 0.56+ Lua dispatch
+
+
+def close(cls):
+    return f"""{CLOSE}({{ window = \"class:^({cls.replace('.', '[.]')})$\" }})'"""
+
+# spoken phrase (after the wake word) -> shell command. Only words the model knows work.
+COMMANDS = {
+    "play spotify": "omarchy-launch-or-focus spotify",
+    "open spotify": "omarchy-launch-or-focus spotify",
+    "play music": f"{MPRIS} Play",
+    "pause music": f"{MPRIS} Pause",
+    "pause": f"{MPRIS} Pause",
+    "next song": f"{MPRIS} Next",
+    "previous song": f"{MPRIS} Previous",
+    "open browser": "omarchy-launch-browser",
+    "open terminal": "uwsm-app -- xdg-terminal-exec",
+    "open editor": "omarchy-launch-editor",
+    "open obsidian": 'omarchy-launch-or-focus ^obsidian$ "uwsm-app -- obsidian"',
+    "open youtube": f'{WEB} "https://youtube.com/"',
+    "open email": f'{WEB} "https://app.hey.com"',
+    "open calendar": f'{WEB} "https://app.hey.com/calendar/weeks/"',
+    "open chat": f'{WEB} "https://chatgpt.com"',
+    "close window": f"{CLOSE}()'",  # whatever is focused
+    "close spotify": close("Spotify"),
+    "close browser": close("chromium"),  # one window per call
+    "close youtube": close("chrome-youtube.com__-Default"),
+    "close chat": close("chrome-chatgpt.com__-Default"),
+    "close obsidian": close("obsidian"),
+}
+# "hey oma play <anything else>" -> search Spotify for it. Optional creds file makes it auto-play.
+CREDS = os.path.expanduser("~/.config/hey-oma/spotify.env")  # SPOTIFY_CLIENT_ID=.. / SPOTIFY_CLIENT_SECRET=..
+
+
+def match(text):
+    """Final transcript -> command, or None if no wake word / unknown phrase."""
+    text = text.strip()
+    if not text.startswith(WAKE):
+        return None
+    return COMMANDS.get(text[len(WAKE):].strip())
+
+
+def song_query(free_text):
+    """Free-form transcript -> song name after 'play', or None."""
+    _, sep, rest = free_text.partition("play ")
+    return rest.strip() or None if sep else None
+
+
+def spotify_track(query):
+    """Top track URI via Spotify Web API (client credentials), or None without creds/on error."""
+    try:
+        env = dict(l.strip().split("=", 1) for l in open(CREDS) if "=" in l)
+        auth = base64.b64encode(f"{env['SPOTIFY_CLIENT_ID']}:{env['SPOTIFY_CLIENT_SECRET']}".encode()).decode()
+        req = urllib.request.Request("https://accounts.spotify.com/api/token", b"grant_type=client_credentials",
+                                     {"Authorization": f"Basic {auth}"})
+        token = json.load(urllib.request.urlopen(req, timeout=5))["access_token"]
+        url = "https://api.spotify.com/v1/search?" + urllib.parse.urlencode({"q": query, "type": "track", "limit": 1})
+        items = json.load(urllib.request.urlopen(
+            urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"}), timeout=5))["tracks"]["items"]
+        return items[0]["uri"] if items else None
+    except Exception as e:  # missing creds, network, API change -> fall back to search page
+        print(f"spotify api: {e!r}", flush=True)
+        return None
+
+
+def play_song(query):
+    if subprocess.run(f"{MPRIS.split(' /')[0]} /org/mpris/MediaPlayer2 org.freedesktop.DBus.Peer Ping",
+                      shell=True, capture_output=True).returncode:
+        subprocess.Popen("omarchy-launch-or-focus spotify", shell=True, start_new_session=True)
+        time.sleep(4)  # ponytail: fixed wait for Spotify cold start; poll D-Bus if it's flaky
+    uri = spotify_track(query) or "spotify:search:" + urllib.parse.quote(query)
+    notify(f"{'playing' if 'track' in uri else 'searching for'} {query}")
+    subprocess.run(f"{MPRIS} OpenUri s {json.dumps(uri)}", shell=True)
+
+
+VERBS = {"open": "opening", "close": "closing", "play": "playing", "pause": "pausing"}
+# hand-written replies win over the verb rule; add lines here, then run `hey-oma --warm`
+REPLIES = {
+    "pause": "paused", "pause music": "paused", "play music": "resuming",
+    "next song": "skipping", "previous song": "going back",
+    "play spotify": "opening spotify", "close window": "closing it",
+}
+EXTRA = ["sorry, I didn't catch that"]  # other lines to pre-generate
+# One folder per voice. Files are named by their text, so you can drop in your own recordings.
+REPLY_DIR = os.path.expanduser("~/.local/share/hey-oma/replies")
+PIPER_VOICE = os.path.expanduser("~/.local/share/hey-oma/voice/en_US-amy-medium.onnx")
+_piper = None
+_cartesia_ok = True  # flips off after a 4xx so we don't wait on it every time
+
+
+def reply(phrase):
+    """'open browser' -> 'opening browser' (what oma says back)."""
+    if phrase in REPLIES:
+        return REPLIES[phrase]
+    verb, _, rest = phrase.partition(" ")
+    return f"{VERBS[verb]} {rest}".strip() if verb in VERBS else phrase
+
+
+def read_env(path):
+    return dict(l.strip().split("=", 1) for l in open(os.path.expanduser(path)) if "=" in l)
+
+
+def cartesia_wav(text, path):
+    env = read_env("~/.config/hey-oma/cartesia.env")  # CARTESIA_API_KEY / CARTESIA_VOICE_ID
+    body = {"model_id": "sonic-3", "transcript": text, "language": "en",
+            "voice": {"mode": "id", "id": env["CARTESIA_VOICE_ID"]},
+            "output_format": {"container": "wav", "encoding": "pcm_s16le", "sample_rate": 44100}}
+    req = urllib.request.Request("https://api.cartesia.ai/tts/bytes", json.dumps(body).encode(), {
+        "X-API-Key": env["CARTESIA_API_KEY"], "Cartesia-Version": "2025-04-16", "Content-Type": "application/json"})
+    audio = urllib.request.urlopen(req, timeout=8).read()
+    with open(path, "wb") as f:
+        f.write(audio)
+
+
+def piper_wav(text, path):
+    global _piper
+    from piper import PiperVoice
+    _piper = _piper or PiperVoice.load(PIPER_VOICE)  # ~1s once, then ~0.1s per phrase
+    with wave.open(path, "wb") as w:
+        _piper.synthesize_wav(text, w)
+
+
+def reply_file(text, play=True):
+    """Cartesia (your voice) -> local Piper -> None. Each result saved as <engine>/<text>.wav."""
+    global _cartesia_ok
+    name = "".join(c for c in text.lower() if c.isalnum() or c in " -'").strip() + ".wav"
+    for engine, make in (("cartesia", cartesia_wav), ("piper", piper_wav)):
+        path = os.path.join(REPLY_DIR, engine, name)
+        if os.path.exists(path):
+            return path
+        if make is cartesia_wav and not _cartesia_ok:
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            make(text, path)
+            return path
+        except Exception as e:
+            print(f"tts {engine}: {e!r}", flush=True)
+            if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500:
+                _cartesia_ok = False
+            if os.path.exists(path):
+                os.remove(path)
+    return None
+
+
+def speak(text):
+    path = reply_file(text)
+    subprocess.run(["mpv", "--no-video", "--really-quiet", path] if path else ["espeak-ng", text])
+
+
+def warm():
+    """Pre-generate every fixed reply, so speaking never needs the network."""
+    for line in sorted({reply(p) for p in COMMANDS} | set(EXTRA)):
+        print(line, "->", reply_file(line))
+
+
+def notify(msg):
+    subprocess.Popen(["notify-send", "-t", "1500", "hey oma", msg])
+    threading.Thread(target=speak, args=(msg,), daemon=True).start()  # don't stall the mic loop
+
+
+def listen():
+    import vosk
+    vosk.SetLogLevel(-1)
+    rate = 16000
+    # Grammar = only our phrases (+ [unk] so other speech is rejected, not forced into a match).
+    grammar = json.dumps([f"{WAKE} {p}" for p in COMMANDS] + [f"{WAKE} play [unk]", "[unk]"])
+    model = vosk.Model(MODEL)
+    rec = vosk.KaldiRecognizer(model, rate, grammar)
+    free = vosk.KaldiRecognizer(model, rate)  # full vocab, only used for song names
+    free_last = ""
+    mic = subprocess.Popen(
+        ["pw-record", "--rate", str(rate), "--channels", "1", "--format", "s16", "-"],
+        stdout=subprocess.PIPE,
+    )
+    print("listening… say 'hey oma <command>'", flush=True)
+    while chunk := mic.stdout.read(4000):
+        if free.AcceptWaveform(chunk):
+            free_last = json.loads(free.Result()).get("text", "")
+        if not rec.AcceptWaveform(chunk):
+            continue
+        text = json.loads(rec.Result()).get("text", "")
+        cmd = match(text)
+        if text.startswith(WAKE):  # background noise is force-fit every ~20s (Kaldi max utterance); don't log it
+            print(f"heard: {text!r} -> {cmd}", flush=True)
+        if not cmd and text.startswith(f"{WAKE} play"):
+            # grammar heard "hey oma play [unk]": take the song name from the free recognizer, same utterance
+            free_text = json.loads(free.FinalResult()).get("text", "") or free_last
+            free_last = ""
+            query = song_query(free_text)
+            print(f"song: {free_text!r} -> {query!r}", flush=True)
+            if query:
+                play_song(query)
+        elif cmd:
+            notify(reply(text[len(WAKE):].strip()))
+            subprocess.Popen(cmd, shell=True, start_new_session=True)
+        elif text.startswith(WAKE):  # wake word but no known command
+            notify(EXTRA[0])
+
+
+def test():
+    assert match("hey oma play spotify") == COMMANDS["play spotify"]
+    assert match("  hey oma   next song ") == COMMANDS["next song"]
+    assert match("play spotify") is None          # no wake word
+    assert match("hey oma [unk]") is None         # unknown phrase
+    assert match("") is None
+    assert match("hey oma close spotify") == """hyprctl dispatch 'hl.dsp.window.close({ window = "class:^(Spotify)$" })'"""
+    assert song_query("hey oh ma play shape of you") == "shape of you"
+    assert song_query("hey oma play ") is None
+    assert song_query("what is the weather") is None
+    assert reply("open browser") == "opening browser"
+    assert reply("pause") == "paused"
+    assert reply("next song") == "skipping"
+    assert reply("close spotify") == "closing spotify"
+    print("ok")
+
+
+if __name__ == "__main__":
+    test() if "--test" in sys.argv else warm() if "--warm" in sys.argv else listen()
