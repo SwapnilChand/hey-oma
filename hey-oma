@@ -45,6 +45,18 @@ COMMANDS = {
     "close chat": close("chrome-chatgpt.com__-Default"),
     "close obsidian": close("obsidian"),
 }
+
+
+def load_commands(path=os.path.expanduser("~/.config/hey-oma/commands")):
+    """Your own commands, one per line: `open ken = xdg-open "tg://resolve?domain=my_bot"`. # comments ok."""
+    if os.path.exists(path):
+        for line in open(path):
+            phrase, sep, cmd = line.partition("=")
+            if sep and not line.lstrip().startswith("#"):
+                COMMANDS[" ".join(phrase.lower().split())] = cmd.strip()
+
+
+load_commands()
 # "hey oma play <anything else>" -> search Spotify for it. Optional creds file makes it auto-play.
 CREDS = os.path.expanduser("~/.config/hey-oma/spotify.env")  # SPOTIFY_CLIENT_ID=.. / SPOTIFY_CLIENT_SECRET=..
 
@@ -314,6 +326,13 @@ def test():
     assert parse_play("hey oma play ") is None
     assert parse_play("play on youtube") is None
     assert parse_play("play goosiest in yt") == ("goosiest", "youtube")
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write('# mine\n  Open  Ken = xdg-open "tg://resolve?domain=x_bot"\nno equals sign here\n')
+    load_commands(f.name)
+    assert COMMANDS.pop("open ken") == 'xdg-open "tg://resolve?domain=x_bot"'
+    assert "# mine" not in COMMANDS and len([k for k in COMMANDS if "equals" in k]) == 0
+    os.remove(f.name)
     assert reply("open browser") == "opening browser"
     assert reply("pause") == "paused"
     assert reply("next song") == "skipping"

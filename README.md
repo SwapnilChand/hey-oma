@@ -50,6 +50,13 @@ Open `hey-oma` and add a line to `COMMANDS`:
 "open files": "nautilus",
 ```
 
+Or keep personal commands out of the code in `~/.config/hey-oma/commands`, one per line:
+
+```
+open ken = xdg-open "tg://resolve?domain=my_telegram_bot"
+open notes = omarchy-launch-or-focus ^obsidian$ "uwsm-app -- obsidian"
+```
+
 Optionally add what oma says back to `REPLIES`, then:
 
 ```bash
