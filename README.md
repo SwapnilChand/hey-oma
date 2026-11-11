@@ -55,6 +55,15 @@ systemctl --user restart hey-oma
 
 Use everyday English words. The speech model doesn't know brand names like "whatsapp", which is why ChatGPT is "open chat".
 
+## Use your own wake word
+
+"hey oma" always works. To add more, list them in `~/.config/hey-oma/wake-words`, one per line:
+
+```bash
+echo "hey goose" >> ~/.config/hey-oma/wake-words
+systemctl --user restart hey-oma
+```
+
 ## Optional: make oma talk in your voice
 
 By default oma replies with a free local voice (Piper). To use your own cloned voice from [Cartesia](https://cartesia.ai):

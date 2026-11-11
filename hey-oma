@@ -10,7 +10,9 @@ Edit COMMANDS to add phrases, REPLIES for what oma says back.
 import base64, json, os, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, wave
 
 MODEL = os.path.expanduser("~/.local/share/hey-oma/model")
-WAKE = "hey oma"
+# "hey oma" plus any extra wake phrases you list in this file, one per line (e.g. "hey goose")
+WAKE_FILE = os.path.expanduser("~/.config/hey-oma/wake-words")
+WAKES = ["hey oma"] + ([l.strip().lower() for l in open(WAKE_FILE) if l.strip()] if os.path.exists(WAKE_FILE) else [])
 MPRIS = "busctl --user call org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player"
 WEB = "omarchy-launch-webapp"
 CLOSE = "hyprctl dispatch 'hl.dsp.window.close"  # Hyprland 0.56+ Lua dispatch
@@ -47,18 +49,25 @@ COMMANDS = {
 CREDS = os.path.expanduser("~/.config/hey-oma/spotify.env")  # SPOTIFY_CLIENT_ID=.. / SPOTIFY_CLIENT_SECRET=..
 
 
+def after_wake(text):
+    """'hey oma open browser' -> 'open browser'; None if it doesn't start with a wake phrase."""
+    text = " ".join(text.split())
+    for wake in WAKES:
+        if text == wake or text.startswith(wake + " "):
+            return text[len(wake):].strip()
+    return None
+
+
 def match(text):
     """Final transcript -> command, or None if no wake word / unknown phrase."""
-    text = text.strip()
-    if not text.startswith(WAKE):
-        return None
-    return COMMANDS.get(text[len(WAKE):].strip())
+    return COMMANDS.get(after_wake(text) or "")
 
 
-def song_query(free_text):
-    """Free-form transcript -> song name after 'play', or None."""
+def song_query(free_text, skip=3):
+    """Free-form transcript -> song name after 'play'. If 'play' was misheard ('slay'),
+    drop the first `skip` words (wake phrase + 'play') instead. None if nothing is left."""
     _, sep, rest = free_text.partition("play ")
-    return rest.strip() or None if sep else None
+    return (rest if sep else " ".join(free_text.split()[skip:])).strip() or None
 
 
 def spotify_track(query):
@@ -160,7 +169,9 @@ def reply_file(text, play=True):
 
 def speak(text):
     path = reply_file(text)
-    subprocess.run(["mpv", "--no-video", "--really-quiet", path] if path else ["espeak-ng", text])
+    # loudnorm: every reply plays at the same loudness, however quiet the voice or recording was
+    subprocess.run(["mpv", "--no-video", "--really-quiet", "--af=lavfi=[loudnorm=I=-14:TP=-1.5:LRA=11]", path]
+                   if path else ["espeak-ng", text])
 
 
 def warm():
@@ -179,7 +190,7 @@ def listen():
     vosk.SetLogLevel(-1)
     rate = 16000
     # Grammar = only our phrases (+ [unk] so other speech is rejected, not forced into a match).
-    grammar = json.dumps([f"{WAKE} {p}" for p in COMMANDS] + [f"{WAKE} play [unk]", "[unk]"])
+    grammar = json.dumps([f"{w} {p}" for w in WAKES for p in COMMANDS] + [f"{w} play [unk]" for w in WAKES] + ["[unk]"])
     model = vosk.Model(MODEL)
     rec = vosk.KaldiRecognizer(model, rate, grammar)
     free = vosk.KaldiRecognizer(model, rate)  # full vocab, only used for song names
@@ -188,28 +199,30 @@ def listen():
         ["pw-record", "--rate", str(rate), "--channels", "1", "--format", "s16", "-"],
         stdout=subprocess.PIPE,
     )
-    print("listening… say 'hey oma <command>'", flush=True)
+    print(f"listening… say {' / '.join(WAKES)} + a command", flush=True)
     while chunk := mic.stdout.read(4000):
         if free.AcceptWaveform(chunk):
             free_last = json.loads(free.Result()).get("text", "")
         if not rec.AcceptWaveform(chunk):
             continue
         text = json.loads(rec.Result()).get("text", "")
-        cmd = match(text)
-        if text.startswith(WAKE):  # background noise is force-fit every ~20s (Kaldi max utterance); don't log it
-            print(f"heard: {text!r} -> {cmd}", flush=True)
-        if not cmd and text.startswith(f"{WAKE} play"):
+        rest = after_wake(text)
+        if rest is None:  # background noise is force-fit every ~20s (Kaldi max utterance); ignore it
+            continue
+        cmd = COMMANDS.get(rest)
+        print(f"heard: {text!r} -> {cmd}", flush=True)
+        if not cmd and rest.startswith("play"):
             # grammar heard "hey oma play [unk]": take the song name from the free recognizer, same utterance
             free_text = json.loads(free.FinalResult()).get("text", "") or free_last
             free_last = ""
-            query = song_query(free_text)
+            query = song_query(free_text, skip=len(text.split()) - len(rest.split()) + 1)
             print(f"song: {free_text!r} -> {query!r}", flush=True)
             if query:
                 play_song(query)
         elif cmd:
-            notify(reply(text[len(WAKE):].strip()))
+            notify(reply(rest))
             subprocess.Popen(cmd, shell=True, start_new_session=True)
-        elif text.startswith(WAKE):  # wake word but no known command
+        else:  # wake word but no known command
             notify(EXTRA[0])
 
 
@@ -219,10 +232,16 @@ def test():
     assert match("play spotify") is None          # no wake word
     assert match("hey oma [unk]") is None         # unknown phrase
     assert match("") is None
+    assert match("hey omar open browser") is None   # wake word must be whole words
+    WAKES.append("hey goose")
+    assert match("hey goose open browser") == COMMANDS["open browser"]
+    assert after_wake("hey goose play shape of you") == "play shape of you"
+    WAKES.remove("hey goose")
     assert match("hey oma close spotify") == """hyprctl dispatch 'hl.dsp.window.close({ window = "class:^(Spotify)$" })'"""
     assert song_query("hey oh ma play shape of you") == "shape of you"
     assert song_query("hey oma play ") is None
-    assert song_query("what is the weather") is None
+    assert song_query("how you slay shame on you") == "shame on you"
+    assert song_query("hey oma") is None
     assert reply("open browser") == "opening browser"
     assert reply("pause") == "paused"
     assert reply("next song") == "skipping"
