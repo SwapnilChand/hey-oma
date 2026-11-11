@@ -104,7 +104,9 @@ REPLIES = {
     "next song": "skipping", "previous song": "going back",
     "play spotify": "opening spotify", "close window": "closing it",
 }
-EXTRA = ["sorry, I didn't catch that"]  # other lines to pre-generate
+ACK = "yaa?"  # said when you only say the wake word; then the next 8s take a command without it
+SORRY = "sorry, I didn't catch that"
+EXTRA = [SORRY, ACK]  # other lines to pre-generate
 # One folder per voice. Files are named by their text, so you can drop in your own recordings.
 REPLY_DIR = os.path.expanduser("~/.local/share/hey-oma/replies")
 PIPER_VOICE = os.path.expanduser("~/.local/share/hey-oma/voice/en_US-amy-medium.onnx")
@@ -190,11 +192,13 @@ def listen():
     vosk.SetLogLevel(-1)
     rate = 16000
     # Grammar = only our phrases (+ [unk] so other speech is rejected, not forced into a match).
-    grammar = json.dumps([f"{w} {p}" for w in WAKES for p in COMMANDS] + [f"{w} play [unk]" for w in WAKES] + ["[unk]"])
+    phrases = list(COMMANDS) + ["play [unk]"]
+    grammar = json.dumps([f"{w} {p}" for w in WAKES for p in phrases] + phrases + ["[unk]"])
     model = vosk.Model(MODEL)
     rec = vosk.KaldiRecognizer(model, rate, grammar)
     free = vosk.KaldiRecognizer(model, rate)  # full vocab, only used for song names
     free_last = ""
+    awake_until = 0.0  # after ACK, a bare command (no wake word) is accepted until this time
     mic = subprocess.Popen(
         ["pw-record", "--rate", str(rate), "--channels", "1", "--format", "s16", "-"],
         stdout=subprocess.PIPE,
@@ -207,7 +211,15 @@ def listen():
             continue
         text = json.loads(rec.Result()).get("text", "")
         rest = after_wake(text)
+        if rest is None and time.time() < awake_until and text and "[unk]" != text:
+            rest = text  # the command that follows "yaa?"
         if rest is None:  # background noise is force-fit every ~20s (Kaldi max utterance); ignore it
+            continue
+        awake_until = 0.0
+        if rest == "":  # just the wake word
+            print(f"heard: {text!r} -> {ACK}", flush=True)
+            notify(ACK)
+            awake_until = time.time() + 8
             continue
         cmd = COMMANDS.get(rest)
         print(f"heard: {text!r} -> {cmd}", flush=True)
@@ -223,7 +235,7 @@ def listen():
             notify(reply(rest))
             subprocess.Popen(cmd, shell=True, start_new_session=True)
         else:  # wake word but no known command
-            notify(EXTRA[0])
+            notify(SORRY)
 
 
 def test():

@@ -32,6 +32,8 @@ Start every command with **"hey oma"**.
 | close window | closes the focused window |
 | close spotify · browser · youtube · chat · obsidian | closes that app |
 
+Or say just **"hey oma"**. It answers *"yaa?"*, and for the next 8 seconds you can say the command on its own.
+
 Watch what it hears:
 
 ```bash
