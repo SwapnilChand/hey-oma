@@ -7,7 +7,7 @@
 Edit COMMANDS to add phrases, REPLIES for what oma says back.
 `hey-oma --warm` pre-generates every reply in your voice; `hey-oma --test` runs the self-check.
 """
-import base64, json, os, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, wave
+import base64, difflib, json, os, re, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, wave
 
 MODEL = os.path.expanduser("~/.local/share/hey-oma/model")
 # "hey oma" plus any extra wake phrases you list in this file, one per line (e.g. "hey goose")
@@ -63,11 +63,71 @@ def match(text):
     return COMMANDS.get(after_wake(text) or "")
 
 
-def song_query(free_text, skip=3):
-    """Free-form transcript -> song name after 'play'. If 'play' was misheard ('slay'),
-    drop the first `skip` words (wake phrase + 'play') instead. None if nothing is left."""
-    _, sep, rest = free_text.partition("play ")
-    return (rest if sep else " ".join(free_text.split()[skip:])).strip() or None
+ON_YOUTUBE = re.compile(r"\s*\b(on |in )?(youtube|you tube|yt|y t)$")
+
+
+def parse_play(text, skip=3):
+    """'Hey Goose, play Goosiest on YT.' -> ('goosiest', 'youtube'); 'play shape of you' -> (.., 'spotify').
+    If 'play' was misheard ('slay'), drop the first `skip` words (wake phrase + 'play'). None if no name."""
+    t = " ".join(re.sub(r"[^\w\s']", " ", text.lower()).split())
+    _, sep, rest = t.partition("play ")
+    rest = rest if sep else " ".join(t.split()[skip:])
+    where = "youtube" if ON_YOUTUBE.search(rest) else "spotify"
+    rest = re.sub(r"^the ", "", ON_YOUTUBE.sub("", rest)).strip()
+    return (rest, where) if rest else None
+
+
+def transcribe(pcm, model):
+    """Accurate text for a 'play …' utterance: Superwhisper if installed, else Vosk (full vocabulary)."""
+    path = os.path.expanduser("~/.local/share/hey-oma/utterance.wav")
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1), w.setsampwidth(2), w.setframerate(16000), w.writeframes(pcm)
+    try:
+        run = lambda *a: subprocess.run(["superwhisper", *a], capture_output=True, text=True, timeout=5).stdout
+        sid = json.loads(run("transcribe", path))["session_id"]
+        for _ in range(60):  # transcribe is async; `read` returns null until it's done
+            r = json.loads(run("read") or "null")
+            if r and r.get("session_id") == sid and r.get("text") is not None:
+                return r["text"]
+            time.sleep(0.25)
+    except Exception as e:
+        print(f"superwhisper: {e!r}", flush=True)
+    import vosk
+    rec = vosk.KaldiRecognizer(model, 16000)
+    rec.AcceptWaveform(pcm)
+    return json.loads(rec.FinalResult()).get("text", "")
+
+
+def yt(*args):
+    return subprocess.run(["yt-dlp", "--no-warnings", "--flat-playlist", *args],
+                          capture_output=True, text=True, timeout=20).stdout.split("\n")[0]
+
+
+def play_youtube(query):
+    """A channel name -> its latest upload; anything else -> the top video. Opens in the YouTube web app."""
+    latest = query.startswith("latest ")
+    query = query.removeprefix("latest ").strip()
+    url, what = "https://www.youtube.com/results?" + urllib.parse.urlencode({"search_query": query}), query
+    try:
+        vid, channel, channel_url = yt("--print", "%(id)s\t%(channel)s\t%(channel_url)s", f"ytsearch1:{query}").split("\t")
+        url = f"https://www.youtube.com/watch?v={vid}"
+        squash = lambda x: re.sub(r"\W", "", x.lower())
+        if latest or difflib.SequenceMatcher(None, squash(channel), squash(query)).ratio() >= 0.8:
+            url, what = f"https://www.youtube.com/watch?v={yt('-I', '1', '--print', '%(id)s', channel_url + '/videos')}", f"the latest from {channel}"
+    except Exception as e:  # no yt-dlp / network: fall back to the search page
+        print(f"yt-dlp: {e!r}", flush=True)
+    notify(f"playing {what}")
+    subprocess.Popen([WEB, url], start_new_session=True)
+
+
+def handle_play(pcm, model, skip):
+    text = transcribe(pcm, model)
+    parsed = parse_play(text, skip)
+    print(f"play: {text!r} -> {parsed}", flush=True)
+    if not parsed:
+        return notify(SORRY)
+    query, where = parsed
+    play_youtube(query) if where == "youtube" else play_song(query)
 
 
 def spotify_track(query):
@@ -196,8 +256,7 @@ def listen():
     grammar = json.dumps([f"{w} {p}" for w in WAKES for p in phrases] + phrases + ["[unk]"])
     model = vosk.Model(MODEL)
     rec = vosk.KaldiRecognizer(model, rate, grammar)
-    free = vosk.KaldiRecognizer(model, rate)  # full vocab, only used for song names
-    free_last = ""
+    utt = bytearray()  # audio since the last final result = the current utterance
     awake_until = 0.0  # after ACK, a bare command (no wake word) is accepted until this time
     mic = subprocess.Popen(
         ["pw-record", "--rate", str(rate), "--channels", "1", "--format", "s16", "-"],
@@ -205,10 +264,10 @@ def listen():
     )
     print(f"listening… say {' / '.join(WAKES)} + a command", flush=True)
     while chunk := mic.stdout.read(4000):
-        if free.AcceptWaveform(chunk):
-            free_last = json.loads(free.Result()).get("text", "")
+        utt += chunk
         if not rec.AcceptWaveform(chunk):
             continue
+        pcm, utt = bytes(utt), bytearray()
         text = json.loads(rec.Result()).get("text", "")
         rest = after_wake(text)
         if rest is None and time.time() < awake_until and text and "[unk]" != text:
@@ -224,13 +283,9 @@ def listen():
         cmd = COMMANDS.get(rest)
         print(f"heard: {text!r} -> {cmd}", flush=True)
         if not cmd and rest.startswith("play"):
-            # grammar heard "hey oma play [unk]": take the song name from the free recognizer, same utterance
-            free_text = json.loads(free.FinalResult()).get("text", "") or free_last
-            free_last = ""
-            query = song_query(free_text, skip=len(text.split()) - len(rest.split()) + 1)
-            print(f"song: {free_text!r} -> {query!r}", flush=True)
-            if query:
-                play_song(query)
+            # grammar heard "hey oma play [unk]": transcribe this utterance properly, off the mic loop
+            skip = len(text.split()) - len(rest.split()) + 1
+            threading.Thread(target=handle_play, args=(pcm, model, skip), daemon=True).start()
         elif cmd:
             notify(reply(rest))
             subprocess.Popen(cmd, shell=True, start_new_session=True)
@@ -250,10 +305,15 @@ def test():
     assert after_wake("hey goose play shape of you") == "play shape of you"
     WAKES.remove("hey goose")
     assert match("hey oma close spotify") == """hyprctl dispatch 'hl.dsp.window.close({ window = "class:^(Spotify)$" })'"""
-    assert song_query("hey oh ma play shape of you") == "shape of you"
-    assert song_query("hey oma play ") is None
-    assert song_query("how you slay shame on you") == "shame on you"
-    assert song_query("hey oma") is None
+    assert parse_play("hey oh ma play shape of you") == ("shape of you", "spotify")
+    assert parse_play("Hey Goose, play Goosiest on YT.") == ("goosiest", "youtube")
+    assert parse_play("hey goose play the latest goosiest on YouTube") == ("latest goosiest", "youtube")
+    assert parse_play("play lofi on you tube") == ("lofi", "youtube")
+    assert parse_play("play don't stop me now") == ("don't stop me now", "spotify")
+    assert parse_play("how you slay shame on you") == ("shame on you", "spotify")
+    assert parse_play("hey oma play ") is None
+    assert parse_play("play on youtube") is None
+    assert parse_play("play goosiest in yt") == ("goosiest", "youtube")
     assert reply("open browser") == "opening browser"
     assert reply("pause") == "paused"
     assert reply("next song") == "skipping"

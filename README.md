@@ -28,6 +28,8 @@ Start every command with **"hey oma"**.
 | open youtube · email · calendar · chat | opens the web app |
 | play spotify | opens Spotify |
 | play *any song name* | finds the song on Spotify |
+| play *a channel* on YouTube / on YT | plays that channel's latest video |
+| play *anything* on YouTube | plays the top video |
 | play music · pause · next song · previous song | controls Spotify |
 | close window | closes the focused window |
 | close spotify · browser · youtube · chat · obsidian | closes that app |
@@ -66,6 +68,16 @@ echo "hey goose" >> ~/.config/hey-oma/wake-words
 systemctl --user restart hey-oma
 ```
 
+## Optional: hear names right (Superwhisper)
+
+Song and video names are free-form, so the small offline model often mishears them. If [Superwhisper](https://superwhisper.com) is installed, oma sends just the "play …" sentence to it instead, which is far more accurate. Teach it unusual names once:
+
+```bash
+superwhisper vocab add Goosiest
+```
+
+YouTube needs `yt-dlp` (`sudo pacman -S yt-dlp`). Without it, oma opens YouTube's search page.
+
 ## Optional: make oma talk in your voice
 
 By default oma replies with a free local voice (Piper). To use your own cloned voice from [Cartesia](https://cartesia.ai):
@@ -96,7 +108,7 @@ EOF
 ## How it works
 
 1. [Vosk](https://alphacephei.com/vosk/) listens to the mic, restricted to the known phrases, so it's accurate and cheap.
-2. A match runs a shell command (the same ones Omarchy's keybindings use).
+2. A match runs a shell command (the same ones Omarchy's keybindings use). A "play …" sentence goes to Superwhisper for the exact name, then to Spotify or YouTube.
 3. Oma speaks a saved reply: your Cartesia voice, then Piper, then espeak.
 
 One Python file, no server, no LLM.
